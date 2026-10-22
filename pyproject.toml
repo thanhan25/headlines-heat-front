@@ -1,0 +1,19 @@
+[project]
+name = "headlines-heat-front"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Thanh An Vo", email = "thanhan25@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit>=1.66.1",
+]
+
+[project.scripts]
+headlines-heat-front = "headlines_heat_front:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
