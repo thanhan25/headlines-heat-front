@@ -312,34 +312,31 @@ def clear_log() -> None:
 
 PRESETS = [
     {
-        "icon": "📊", "tag": "SCENARIO 01", "key": "bullish", "title": "Quarterly Results",
-        "desc": "Quarterly performance figures, forward guidance, and margin updates.",
+        "icon": "📄", "tag": "SCENARIO 01", "key": "bullish", "title": "Earnings Breakout",
+        "desc": "Quarterly results, data-centre guidance, and margin commentary.",
         "headlines": [
-            "NVIDIA reports Q4 revenue surge of 78% YoY, exceeding institutional consensus",
-            "Management raises full-year data center guidance amid AI chip demand",
-            "Gross margins expand sequentially as pricing power accelerates",
+            "NVIDIA reports Q4 revenue surge of 78% YoY, crushing institutional consensus.",
+            "Management raises full-year data center guidance amid unprecedented AI chip demand.",
         ],
-        "summary": "The story combines quarterly results, backlog commentary, and forward guidance.",
+        "summary": "Strong gross margin expansion and record backlog drive immediate after-hours rally.",
     },
     {
-        "icon": "🧾", "tag": "SCENARIO 02", "key": "bearish", "title": "Guidance & Leadership",
-        "desc": "An outlook revision, an executive transition, and a regulatory inquiry.",
+        "icon": "📄", "tag": "SCENARIO 02", "key": "bearish", "title": "Guidance Shock",
+        "desc": "An outlook update, leadership change, and regulatory inquiry.",
         "headlines": [
-            "Company cuts full-year operating margin outlook citing supply chain bottlenecks",
-            "CFO steps down unexpectedly as regulator opens an inquiry into revenue recognition",
-            "Institutional desks downgrade equity following an unexpected earnings miss",
+            "Company slashes full-year operating margin outlook citing severe supply chain bottlenecks.",
+            "CFO steps down unexpectedly as SEC opens inquiry into revenue recognition practices.",
         ],
-        "summary": "The story combines an outlook revision, leadership turnover, and a regulatory inquiry.",
+        "summary": "Institutional desks downgrade equity rating following unexpected Q3 earnings miss.",
     },
     {
-        "icon": "📋", "tag": "SCENARIO 03", "key": "neutral", "title": "Routine Filing",
-        "desc": "A dividend declaration, shareholder-meeting agenda, and operations update.",
+        "icon": "📄", "tag": "SCENARIO 03", "key": "neutral", "title": "Routine Filing",
+        "desc": "A dividend declaration, shareholder meeting, and operations update.",
         "headlines": [
-            "Board declares regular quarterly cash dividend of $0.25 per share",
-            "Annual shareholder meeting scheduled for next month with standard proxy proposals",
-            "Operations remain in line with multi-year historical averages",
+            "Board of directors declares regular quarterly cash dividend of $0.25 per share.",
+            "Annual shareholder meeting scheduled for next month with standard proxy proposals.",
         ],
-        "summary": "The story combines a routine dividend declaration, proxy agenda, and operations update.",
+        "summary": "Operations remain in line with multi-year historical averages with no guidance changes.",
     },
 ]
 
@@ -548,19 +545,32 @@ def _fetch_one_ticker(item: dict[str, str]) -> Optional[dict[str, Any]]:
 
 
 @st.cache_data(ttl=MARKET_QUOTES_TTL_S, show_spinner=False)
-def fetch_market_quotes() -> dict[str, dict[str, Any]]:
-    """Fetch quotes concurrently; cache results briefly to protect the free feed."""
+def fetch_market_quotes() -> dict[str, Any]:
+    """Fetch best-effort Yahoo Finance snapshots and cache them briefly.
+
+    The cached metadata timestamp represents when the provider requests actually ran,
+    not when a later Streamlit rerun rendered the ticker.
+    """
     from concurrent.futures import as_completed
 
     found: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=min(16, len(TICKER_UNIVERSE))) as pool:
+    with ThreadPoolExecutor(max_workers=min(12, len(TICKER_UNIVERSE))) as pool:
         future_items = {pool.submit(_fetch_one_ticker, item): item for item in TICKER_UNIVERSE}
         for future in as_completed(future_items):
-            quote = future.result()
+            try:
+                quote = future.result()
+            except Exception:
+                # A single failed symbol should never take down the whole banner.
+                quote = None
             if quote is not None:
                 found[quote["label"]] = quote
-    # Preserve the order defined in TICKER_UNIVERSE.
-    return {item["label"]: found[item["label"]] for item in TICKER_UNIVERSE if item["label"] in found}
+    # Preserve the universe order and distinguish fetch time from provider market time.
+    ordered: dict[str, Any] = {
+        item["label"]: found[item["label"]]
+        for item in TICKER_UNIVERSE if item["label"] in found
+    }
+    ordered["_meta"] = {"fetched_at": time.time(), "provider": "Yahoo Finance chart endpoint"}
+    return ordered
 
 
 def _format_quote_price(quote: dict[str, Any]) -> str:
@@ -578,50 +588,87 @@ def _format_quote_price(quote: dict[str, Any]) -> str:
     return f"{price:,.2f}"
 
 
-def _ticker_html(quotes: dict[str, dict[str, Any]], use_demo: bool) -> str:
-    if use_demo:
-        items = [
-            (label, price, delta, is_up, True)
-            for label, price, delta, is_up in DEMO_TICKERS
-        ]
-        source_badge = "DEMO MODE · ILLUSTRATIVE VALUES · LIVE FEED UNAVAILABLE"
+def _ticker_html(quotes: dict[str, Any], use_demo: bool = False) -> str:
+    """Render all instruments, marking every fallback quote individually as DEMO."""
+    demo_by_label = {
+        label: {"label": label, "price_text": price, "change_text": delta, "is_up": is_up}
+        for label, price, delta, is_up in DEMO_TICKERS
+    }
+    items: list[dict[str, Any]] = []
+    live_count = 0
+
+    for spec in TICKER_UNIVERSE:
+        label = spec["label"]
+        quote = quotes.get(label)
+        if quote is not None:
+            live_count += 1
+            change = quote.get("change_pct")
+            delta_label = f"{change:+.2f}%" if change is not None else "—"
+            market_ts = quote.get("market_timestamp")
+            title = "Yahoo Finance market snapshot; real-time status is not guaranteed"
+            try:
+                if market_ts:
+                    provider_time = datetime.fromtimestamp(float(market_ts), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    title += f" · provider market timestamp: {provider_time}"
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+            items.append({
+                "label": label,
+                "price": _format_quote_price(quote),
+                "delta": delta_label,
+                "is_up": bool(change is not None and change >= 0),
+                "is_demo": False,
+                "title": title,
+            })
+        else:
+            demo = demo_by_label.get(label)
+            if demo is None:
+                continue
+            items.append({
+                "label": label,
+                "price": demo["price_text"],
+                "delta": demo["change_text"],
+                "is_up": demo["is_up"],
+                "is_demo": True,
+                "title": "DEMO placeholder only — not a current market quote",
+            })
+
+    total = len(TICKER_UNIVERSE)
+    if live_count == 0:
+        source_badge = "DEMO MODE · NO PROVIDER SNAPSHOT RECEIVED"
+        source_class = "demo"
+    elif live_count < total:
+        source_badge = f"PARTIAL YAHOO SNAPSHOT · {live_count}/{total} QUOTES · MISSING VALUES MARKED DEMO"
         source_class = "demo"
     else:
-        items = []
-        for spec in TICKER_UNIVERSE:
-            quote = quotes.get(spec["label"])
-            if quote is None:
-                continue
-            change = quote.get("change_pct")
-            if change is None:
-                delta_label, is_up = "—", False
-            else:
-                delta_label = f"{change:+.2f}%"
-                is_up = change >= 0
-            items.append((quote["label"], _format_quote_price(quote), delta_label, is_up, False))
-        source_badge = (
-            "YAHOO FINANCE SNAPSHOT · MAY BE DELAYED"
-            if len(items) == len(TICKER_UNIVERSE)
-            else f"PARTIAL YAHOO FINANCE SNAPSHOT · {len(items)}/{len(TICKER_UNIVERSE)} QUOTES · MAY BE DELAYED"
-        )
+        source_badge = "YAHOO FINANCE SNAPSHOT · REAL-TIME STATUS NOT GUARANTEED"
         source_class = "live"
 
     rendered_items = []
-    for label, price, delta, is_up, is_demo in items:
+    for item in items:
+        delta = item["delta"]
+        is_up = item["is_up"]
         movement_cls = "ticker-up" if is_up else ("ticker-down" if delta != "—" else "ticker-flat")
         arrow = "▲" if is_up else ("▼" if delta != "—" else "•")
-        demo_tag = '<span class="ticker-demo-tag">DEMO</span>' if is_demo else ""
+        demo_tag = '<span class="ticker-demo-tag">DEMO</span>' if item["is_demo"] else ""
         rendered_items.append(
-            f'<div class="ticker-item"><span class="ticker-sym">{safe_text(label, 20)}</span>'
-            f'<span class="ticker-price">{safe_text(price, 30)}</span>'
+            f'<div class="ticker-item" title="{safe_text(item["title"], 220)}">'
+            f'<span class="ticker-sym">{safe_text(item["label"], 20)}</span>'
+            f'<span class="ticker-price">{safe_text(item["price"], 30)}</span>'
             f'<span class="{movement_cls}">{arrow} {safe_text(delta, 20)}</span>{demo_tag}</div>'
         )
+
     track = "".join(rendered_items)
-    retrieved = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    fetched_at = (quotes.get("_meta") or {}).get("fetched_at")
+    try:
+        retrieved = datetime.fromtimestamp(float(fetched_at), timezone.utc).strftime("%H:%M:%S UTC")
+    except (TypeError, ValueError, OverflowError, OSError):
+        retrieved = "TIME UNAVAILABLE"
+
     return (
         '<div class="ticker-wrap" role="region" aria-label="Market ticker">'
         f'<div class="ticker-meta"><span class="ticker-source {source_class}">{source_badge}</span>'
-        f'<span class="ticker-updated">RETRIEVED {retrieved}</span></div>'
+        f'<span class="ticker-updated">FETCHED {safe_text(retrieved, 30)}</span></div>'
         f'<div class="ticker-viewport"><div class="ticker-track">{track}{track}</div></div>'
         '</div>'
     )
@@ -660,21 +707,30 @@ with head_right:
     st.toggle("☀️ Light" if st.session_state.theme == "dark" else "🌙 Dark",
               key="theme_toggle", on_change=toggle_theme)
 
-market_quotes = fetch_market_quotes()
-# Prefer real provider results; when none are reachable, render clearly marked demo values.
-using_demo_quotes = not bool(market_quotes)
-ticker_col, refresh_col = st.columns([12, 1], gap="small")
-with ticker_col:
-    st.markdown(_ticker_html(market_quotes, using_demo_quotes), unsafe_allow_html=True)
-with refresh_col:
-    refresh_quotes = st.button("↻ Refresh", key="refresh_market_quotes", help="Fetch a fresh Yahoo Finance snapshot")
-if refresh_quotes:
-    fetch_market_quotes.clear()
-    st.rerun()
-if using_demo_quotes:
-    st.caption("Demo prices are illustrative placeholders only; they are not current market quotes.")
-else:
-    st.caption("Yahoo Finance chart snapshots may be delayed, incomplete, or unavailable for some markets. Hover over the ticker to pause it.")
+@st.fragment(run_every=MARKET_QUOTES_TTL_S)
+def render_market_ticker() -> None:
+    """Refresh only the quote banner periodically; do not rerun model inference."""
+    market_quotes = fetch_market_quotes()
+    # A partial provider response must not make missing symbols disappear or look live.
+    using_demo_quotes = not any(spec["label"] in market_quotes for spec in TICKER_UNIVERSE)
+    ticker_col, refresh_col = st.columns([12, 1], gap="small")
+    with ticker_col:
+        st.markdown(_ticker_html(market_quotes, using_demo_quotes), unsafe_allow_html=True)
+    with refresh_col:
+        refresh_quotes = st.button(
+            "↻ Refresh", key="refresh_market_quotes",
+            help="Fetch a fresh Yahoo Finance snapshot now",
+        )
+    if refresh_quotes:
+        fetch_market_quotes.clear()
+        st.rerun()
+    if using_demo_quotes:
+        st.caption("Demo prices are illustrative placeholders only; they are not current market quotes. The banner retries automatically about every 90 seconds while this page is open.")
+    else:
+        st.caption("Yahoo Finance snapshots are best-effort and may be delayed or stale outside market hours; they are not guaranteed tick-by-tick real-time quotes. Missing symbols are marked DEMO. Hover over the ticker to pause it. Automatic refresh: about every 90 seconds.")
+
+
+render_market_ticker()
 st.markdown("""
 <div class="hero-stack"><div>
 <h1 class="hero-title">Headlines Heat <span class="accent">Prediction</span></h1>
@@ -709,7 +765,7 @@ for index, preset in enumerate(PRESETS):
             ):
                 load_preset(index)
                 st.rerun()
-st.markdown('<div class="preset-hint">Synthetic test inputs only · no expected label is shown · selecting a scenario only fills the editor; it does not run inference.</div>', unsafe_allow_html=True)
+st.markdown('<div class="preset-hint">Synthetic test inputs only · model outcomes are not disclosed in advance · selecting a scenario only fills the editor; it does not run inference.</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════
 # 02 / 03 · INPUT + CONFIG
