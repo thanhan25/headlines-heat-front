@@ -2,7 +2,7 @@
 
 Drop-in replacement for the existing backend helper functions:
     safe_text, _error_hint, call_with_retry, parse_prediction_response,
-    call_svc, call_finbert, get_circuit_breaker
+    call_svc, call_finbert, call_lstm, get_circuit_breaker
 
 The module deliberately does not depend on Streamlit, so its behavior can be unit-tested.
 """
@@ -26,6 +26,7 @@ MAX_RESPONSE_BYTES = 1_000_000
 BINARY_TOLERANCE = 1e-9
 PROBABILITY_SUM_TOLERANCE = 0.03
 FINBERT_PROBABILITY_KEYS = ("cold", "hot_rising", "hot_falling")
+LSTM_PROBABILITY_KEYS = ("cold", "hot")
 RETRYABLE_STATUSES = {408, 425, 429}
 
 
@@ -90,7 +91,6 @@ class CircuitBreaker:
             if self._opened_until and now < self._opened_until:
                 return False, self._opened_until - now
             if self._opened_until and now >= self._opened_until:
-                # Permit one trial request after cooldown; concurrent callers wait.
                 if self._half_open_probe:
                     return False, 1.0
                 self._half_open_probe = True
@@ -148,12 +148,7 @@ def call_with_retry(
     breaker: bool = True,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Request an endpoint with bounded retries and honest timing/attempt counts.
-
-    Retries connection/time-out errors and transient HTTP statuses only. Client
-    errors (4xx, except 408/425/429) are returned immediately. ``latency_ms`` is
-    elapsed wall time for the complete operation, including backoff delays.
-    """
+    """Request an endpoint with bounded retries and honest timing/attempt counts."""
     method = method.upper().strip()
     if method not in {"GET", "POST"}:
         return {
@@ -221,7 +216,6 @@ def call_with_retry(
     if cb is not None:
         if (last_status is not None and 400 <= last_status < 500
                 and last_status not in RETRYABLE_STATUSES):
-            # A client error proves the endpoint responded; don't count it as an outage.
             cb.record_success()
         else:
             cb.record_failure()
@@ -369,6 +363,60 @@ def call_finbert(url: str, headline: str, summary: str, timeout: int = 20) -> di
         return result
 
     probs_ok, probs_error = _validate_finbert_probabilities(payload)
+    if not probs_ok:
+        result.update(ok=False, data=payload, error=probs_error)
+        return result
+
+    result.update(ok=True, val=payload["prediction"], data=payload, error="")
+    return result
+
+
+def _validate_lstm_probabilities(payload: dict[str, Any]) -> tuple[bool, str]:
+    probs = payload.get("probabilities")
+    if not isinstance(probs, dict):
+        return False, "LSTM response must include a 'probabilities' JSON object."
+
+    normalized: dict[str, float] = {}
+    for key in LSTM_PROBABILITY_KEYS:
+        if key not in probs:
+            return False, f"LSTM probabilities missing '{key}'."
+        try:
+            value = float(probs[key])
+        except (TypeError, ValueError, OverflowError):
+            return False, f"LSTM probability '{key}' must be numeric."
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            return False, f"LSTM probability '{key}' must be finite and between 0 and 1."
+        normalized[key] = value
+
+    total = sum(normalized.values())
+    if abs(total - 1.0) > PROBABILITY_SUM_TOLERANCE:
+        return False, f"LSTM class probabilities must sum to 1 (received {total:.4f})."
+    payload["probabilities"] = normalized
+    payload["prob_hot"] = normalized["hot"]
+    payload["prob_cold"] = normalized["cold"]
+    return True, ""
+
+
+def call_lstm(url: str, headline: str, summary: str = "", timeout: int = 20) -> dict[str, Any]:
+    """Call POST /lstm_predict on the LSTM service and validate binary + probability outputs."""
+    result = _result_template()
+    response_meta = call_with_retry(
+        f"{url.rstrip('/')}/lstm_predict", method="POST",
+        json={"headline": headline, "summary": summary},
+        timeout=(CONNECT_TIMEOUT_S, timeout),
+    )
+    for key in ("latency_ms", "last_attempt_latency_ms", "attempts", "status"):
+        result[key] = response_meta.get(key)
+    if not response_meta["ok"]:
+        result["error"] = response_meta["error"]
+        return result
+
+    ok, payload, error = parse_prediction_response(response_meta["response"])
+    if not ok:
+        result.update(data=payload, error=error)
+        return result
+
+    probs_ok, probs_error = _validate_lstm_probabilities(payload)
     if not probs_ok:
         result.update(ok=False, data=payload, error=probs_error)
         return result

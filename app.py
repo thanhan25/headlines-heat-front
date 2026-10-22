@@ -15,7 +15,7 @@ from typing import Any, Optional
 import requests
 import streamlit as st
 
-from sentinel_hardening import call_finbert, call_svc, safe_text
+from sentinel_hardening import call_finbert, call_lstm, call_svc, safe_text
 
 # ═══════════════════════════════════════════════════════════════════════
 # Headlines Heat Prediction — financial headline classification workbench.
@@ -39,6 +39,10 @@ LOG_LEN = 12
 LSTM_MODEL_CODE = 7
 MARKET_QUOTES_TTL_S = 90
 MARKET_HTTP_TIMEOUT = (1.2, 2.2)
+
+DEFAULT_SVC_API_URL = "https://stockapi-241812484319.europe-west1.run.app"
+DEFAULT_FINBERT_API_URL = "https://trading-heat-api-398091546603.europe-west1.run.app"
+LSTM_PLACEHOLDER_URL = "https://YOUR-LSTM-SERVICE-URL.europe-west1.run.app"
 
 # ── Session state and theme ────────────────────────────────────────────
 st.session_state.setdefault("theme", "dark")
@@ -106,8 +110,6 @@ LIGHT_TOKENS = {
 }
 THEME = DARK_TOKENS if st.session_state.theme == "dark" else LIGHT_TOKENS
 
-# The CSS deliberately uses a small set of theme tokens so the visual design
-# stays consistent without having to interpolate braces throughout the CSS.
 OVERRIDE_CSS = Template(r"""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap');
 :root {
@@ -156,7 +158,7 @@ small,.stCaption,[data-testid="stCaption"]{color:var(--text-muted)!important}
 .topbar-left{display:flex;align-items:center;gap:13px}.brand-mark{width:36px;height:36px;border-radius:10px;background:var(--gradient-accent);display:flex;align-items:center;justify-content:center;font-family:'Instrument Serif',serif;font-size:21px;font-style:italic;color:#fff;box-shadow:0 4px 14px rgba(59,130,246,.25)}
 .brand-title{font-size:14px;font-weight:800;letter-spacing:.02em;color:var(--text-primary)}.brand-tag{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-muted);letter-spacing:.1em;text-transform:uppercase;margin-top:3px}
 .topbar-right{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.chip{display:inline-flex;align-items:center;gap:7px;padding:6px 10px;border-radius:20px;font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:700;letter-spacing:.04em;border:1px solid var(--border-subtle)}
-.chip.ok{color:var(--emerald);background:var(--emerald-glow)}.chip.bad{color:var(--rose);background:var(--rose-glow)}.chip.unk{color:var(--text-muted);background:var(--bg-elevated)}.chip-dot{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 6px currentColor}
+.chip.ok{color:var(--emerald);background:var(--emerald-glow)}.chip.bad{color:var(--rose);background:var(--rose-glow)}.chip.unk{color:var(--amber);background:var(--amber-glow)}.chip-dot{width:6px;height:6px;border-radius:50%;background:currentColor;box-shadow:0 0 6px currentColor}
 .hero-stack{display:flex;justify-content:space-between;align-items:flex-end;padding:8px 4px 28px;gap:24px;flex-wrap:wrap}.hero-title{font-size:clamp(2rem,3.8vw,2.8rem);font-weight:800;letter-spacing:-.045em;line-height:1.04;margin:0 0 13px;color:var(--text-primary)}
 .hero-title .accent{font-family:'Instrument Serif',serif;font-style:italic;font-weight:400;background:var(--gradient-accent);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .hero-sub{font-size:.93rem;color:var(--text-secondary);max-width:680px;line-height:1.65;margin:0}.hero-specs{display:grid;grid-template-columns:repeat(3,auto);gap:10px;background:var(--bg-panel);border:1px solid var(--border-subtle);padding:13px 15px;border-radius:10px;box-shadow:var(--shadow-sm)}
@@ -164,7 +166,7 @@ small,.stCaption,[data-testid="stCaption"]{color:var(--text-muted)!important}
 .section-label{display:flex;align-items:center;gap:10px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.16em;font-weight:700;margin:8px 0 14px}.section-label:before{content:"";width:22px;height:1px;background:var(--gradient-accent)}.section-label:after{content:attr(data-num);font-size:9px;padding:2px 7px;border-radius:3px;background:var(--bg-elevated);color:var(--cobalt);border:1px solid var(--border-subtle);margin-left:auto}
 .preset-note{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.07em;text-transform:uppercase;font-weight:700;margin:9px 1px 0}.preset-note.bull{color:var(--emerald)}.preset-note.bear{color:var(--rose)}.preset-note.neutral{color:var(--cyan)}.preset-hint{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-muted);margin:10px 0 24px 2px}
 .verdict-banner{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:15px;padding:25px 28px;margin-bottom:22px;display:grid;grid-template-columns:auto 1fr;gap:22px;align-items:center;box-shadow:var(--shadow-md);position:relative;overflow:hidden}
-.verdict-banner:before{content:"";position:absolute;top:0;left:0;right:0;height:2px}.verdict-hot{background:linear-gradient(135deg,var(--amber-glow),var(--bg-card) 72%);border-color:rgba(245,158,11,.3)}.verdict-hot:before{background:var(--gradient-hot)}.verdict-cold{background:linear-gradient(135deg,var(--cyan-glow),var(--bg-card) 72%);border-color:rgba(56,189,248,.3)}.verdict-cold:before{background:var(--gradient-cold)}.verdict-bull{background:linear-gradient(135deg,var(--emerald-glow),var(--bg-card) 72%);border-color:rgba(16,185,129,.3)}.verdict-bull:before{background:var(--gradient-bull)}.verdict-bear{background:linear-gradient(135deg,var(--rose-glow),var(--bg-card) 72%);border-color:rgba(244,63,94,.3)}.verdict-bear:before{background:var(--gradient-bear)}.verdict-split{background:linear-gradient(135deg,rgba(148,163,184,.09),var(--bg-card) 72%);border-color:rgba(148,163,184,.3)}.verdict-split:before{background:linear-gradient(90deg,var(--cyan),var(--amber),var(--rose))}.verdict-partial{background:linear-gradient(135deg,rgba(244,63,94,.07),var(--bg-card) 72%);border-color:rgba(244,63,94,.26)}.verdict-partial:before{background:var(--gradient-bear)}
+.verdict-banner:before{content:"";position:absolute;top:0;left:0;right:0;height:2px}.verdict-hot{background:linear-gradient(135deg,var(--amber-glow),var(--bg-card) 72%);border-color:rgba(245,158,11,.3)}.verdict-hot:before{background:var(--gradient-hot)}.verdict-cold{background:linear-gradient(135deg,var(--cyan-glow),var(--bg-card) 72%);border-color:rgba(56,189,248,.3)}.verdict-cold:before{background:var(--gradient-cold)}.verdict-bull{background:linear-gradient(135deg,var(--emerald-glow),var(--bg-card) 72%);border-color:rgba(16,185,129,.3)}.verdict-bull:before{background:var(--gradient-bull)}.verdict-bear{background:linear-gradient(135deg,var(--rose-glow),var(--bg-card) 72%);border-color:rgba(244,63,94,.3)}.verdict-bear:before{background:var(--gradient-bear)}.verdict-split{background:linear-gradient(135deg,rgba(148,163,184,.09),var(--bg-card) 72%);border-color:rgba(148,163,184,.3)}.verdict-split:before{background:linear-gradient(90deg,var(--cyan),var(--amber),var(--rose))}.verdict-partial{background:linear-gradient(135deg,var(--rose-glow),var(--bg-card) 72%);border-color:rgba(244,63,94,.26)}.verdict-partial:before{background:var(--gradient-bear)}
 .verdict-eyebrow{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.13em;font-weight:700;margin-bottom:7px}.verdict-title{font-size:clamp(1.2rem,2vw,1.55rem);font-weight:800;letter-spacing:-.025em;margin:0 0 7px;line-height:1.2;color:var(--text-primary)}.verdict-sub{font-size:.87rem;color:var(--text-secondary);margin:0;line-height:1.55}.verdict-meta-row{display:flex;gap:14px;margin-top:13px;font-family:'JetBrains Mono',monospace;font-size:9.5px;color:var(--text-muted);flex-wrap:wrap;align-items:center}.verdict-meta-k{color:var(--text-tertiary);margin-right:4px;font-weight:700}.verdict-delta{font-family:'JetBrains Mono',monospace;font-size:9px;padding:3px 7px;border-radius:4px;margin-left:6px}.verdict-delta.up{background:var(--emerald-glow);color:var(--emerald)}.verdict-delta.down{background:var(--rose-glow);color:var(--rose)}.verdict-delta.flat{background:var(--bg-elevated);color:var(--text-muted)}
 .v-hot{color:var(--amber);font-weight:700}.v-cold{color:var(--cyan);font-weight:700}.v-bull{color:var(--emerald);font-weight:700}.v-bear{color:var(--rose);font-weight:700}.v-err{color:var(--rose);font-weight:700}.v-na{color:var(--text-faint);font-weight:700}
 .glass-card{background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:15px;padding:22px;position:relative;overflow:hidden;box-shadow:var(--shadow-md);height:100%}.regime-hot{border-color:rgba(245,158,11,.3);background:linear-gradient(160deg,var(--amber-glow),var(--bg-card) 48%)}.regime-cold{border-color:rgba(56,189,248,.3);background:linear-gradient(160deg,var(--cyan-glow),var(--bg-card) 48%)}.regime-bull{border-color:rgba(16,185,129,.3);background:linear-gradient(160deg,var(--emerald-glow),var(--bg-card) 48%)}.regime-bear{border-color:rgba(244,63,94,.3);background:linear-gradient(160deg,var(--rose-glow),var(--bg-card) 48%)}
@@ -173,7 +175,7 @@ small,.stCaption,[data-testid="stCaption"]{color:var(--text-muted)!important}
 .metrics-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:16px;padding-top:15px;border-top:1px solid var(--border-subtle)}.metric-cell{background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:8px;padding:10px 8px;text-align:center}.metric-val{font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:700;color:var(--text-primary)}.metric-lbl{font-family:'JetBrains Mono',monospace;font-size:8px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-top:4px;font-weight:700}
 .hard-badge{display:inline-flex;align-items:center;gap:7px;padding:8px 11px;border-radius:8px;background:var(--bg-elevated);border:1px solid var(--border-subtle);font-family:'JetBrains Mono',monospace;font-size:9.5px;font-weight:600;color:var(--text-tertiary);margin-top:5px}.hard-dot{width:7px;height:7px;border-radius:50%;background:var(--cyan)}.hard-badge.hot .hard-dot{background:var(--amber)}.hard-badge.cold .hard-dot{background:var(--cyan)}.hard-val{color:var(--text-primary)}
 .token-heatmap{margin-top:18px;padding-top:15px;border-top:1px solid var(--border-subtle)}.token-heatmap-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}.token-heatmap-label{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;font-weight:700}.heat-legend{font-family:'JetBrains Mono',monospace;font-size:8px;color:var(--text-muted)}.heat-swatch{display:inline-block;width:12px;height:8px;border-radius:2px;margin:0 2px;border:1px solid var(--border-subtle)}.hs-1{background:transparent}.hs-2{background:var(--heat-2)}.hs-3{background:var(--heat-3)}.hs-4{background:var(--heat-4)}.hs-5{background:var(--heat-5)}.token-row{display:flex;flex-wrap:wrap;gap:5px}.token{font-size:11px;padding:4px 7px;border-radius:5px;font-weight:500;color:var(--text-secondary)}.token.weight-5{background:var(--heat-5);color:var(--amber);font-weight:700}.token.weight-4{background:var(--heat-4);color:var(--text-primary);font-weight:600}.token.weight-3{background:var(--heat-3);color:var(--text-secondary)}.token.weight-2{background:var(--heat-2);color:var(--text-tertiary)}.token.weight-1{background:transparent;color:var(--text-muted)}
-.spectrum-wrapper{margin:16px 0}.spectrum-header{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;font-weight:600}.spectrum-bar{display:flex;height:9px;width:100%;background:var(--bg-input);border-radius:5px;overflow:hidden;gap:1px;border:1px solid var(--border-subtle)}.seg-cold{background:var(--gradient-cold)}.seg-rising{background:var(--gradient-bull)}.seg-falling{background:var(--gradient-bear)}.prob-grid{display:flex;flex-direction:column;gap:8px;margin-top:15px}.prob-row{background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:8px;padding:9px 11px}.prob-meta{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:6px;font-family:'JetBrains Mono',monospace;font-size:10px}.prob-name{color:var(--text-tertiary)}.prob-pct{color:var(--text-primary);font-weight:700}.prob-track{width:100%;height:5px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:3px;overflow:hidden}.prob-fill{height:100%;border-radius:3px}.prob-fill-cold{background:var(--gradient-cold)}.prob-fill-bull{background:var(--gradient-bull)}.prob-fill-bear{background:var(--gradient-bear)}
+.spectrum-wrapper{margin:16px 0}.spectrum-header{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;font-weight:600}.spectrum-bar{display:flex;height:9px;width:100%;background:var(--bg-input);border-radius:5px;overflow:hidden;gap:1px;border:1px solid var(--border-subtle)}.seg-cold{background:var(--gradient-cold)}.seg-rising{background:var(--gradient-bull)}.seg-falling{background:var(--gradient-bear)}.seg-hot{background:var(--gradient-hot)}.prob-grid{display:flex;flex-direction:column;gap:8px;margin-top:15px}.prob-row{background:var(--bg-elevated);border:1px solid var(--border-subtle);border-radius:8px;padding:9px 11px}.prob-meta{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:6px;font-family:'JetBrains Mono',monospace;font-size:10px}.prob-name{color:var(--text-tertiary)}.prob-pct{color:var(--text-primary);font-weight:700}.prob-track{width:100%;height:5px;background:var(--bg-input);border:1px solid var(--border-subtle);border-radius:3px;overflow:hidden}.prob-fill{height:100%;border-radius:3px}.prob-fill-cold{background:var(--gradient-cold)}.prob-fill-bull{background:var(--gradient-bull)}.prob-fill-bear{background:var(--gradient-bear)}.prob-fill-hot{background:var(--gradient-hot)}
 .route-tag{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;background:var(--bg-elevated);border:1px solid var(--border-subtle);font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-tertiary);margin-top:14px}.route-method{padding:2px 6px;border-radius:4px;font-weight:700;font-size:8.5px}.route-method.get{background:var(--emerald-glow);color:var(--emerald)}.route-method.post{background:rgba(59,130,246,.15);color:var(--cobalt)}
 .meta-table,.manifest,.log-table{width:100%;border-collapse:collapse;font-family:'JetBrains Mono',monospace;font-size:10px}.meta-table{margin-top:12px}.meta-table tr,.manifest tr,.log-table td{border-bottom:1px solid var(--border-subtle)}.meta-table tr:last-child,.manifest tr:last-child,.log-table tr:last-child td{border-bottom:none}.meta-table td,.manifest td{padding:8px 4px}.meta-table td:first-child{color:var(--text-muted)}.meta-table td:last-child{text-align:right;color:var(--text-primary);font-weight:600}.manifest td{color:var(--text-tertiary);vertical-align:top}.manifest td:first-child{width:45px;color:var(--text-muted);font-weight:700}.manifest td:last-child{text-align:right;white-space:nowrap;color:var(--text-muted)}.log-table th{text-align:left;color:var(--text-muted);font-weight:700;text-transform:uppercase;letter-spacing:.08em;font-size:8.5px;padding:6px 7px;border-bottom:1px solid var(--border-subtle)}.log-table td{padding:8px 7px;color:var(--text-secondary)}
 .placeholder-box{border:1px dashed var(--border-subtle);background:var(--bg-elevated);border-radius:9px;padding:14px 16px;margin-top:12px}.ph-title{font-family:'JetBrains Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--amber);font-weight:700;margin-bottom:6px}.ph-body{font-size:11px;color:var(--text-tertiary);line-height:1.55}.empty-state{text-align:center;padding:42px 22px;background:var(--bg-card);border:1px dashed var(--border-subtle);border-radius:15px}.empty-icon{font-size:34px;margin-bottom:11px}.empty-title{font-size:1.1rem;font-weight:750;color:var(--text-primary);margin-bottom:7px}.empty-desc{font-size:.85rem;color:var(--text-tertiary);max-width:510px;margin:0 auto;line-height:1.6}.footnote{text-align:center;padding:32px 0 8px;font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text-faint);letter-spacing:.04em;line-height:1.8}.footnote-brand{color:var(--text-muted);font-weight:700}
@@ -197,7 +199,6 @@ small,.stCaption,[data-testid="stCaption"]{color:var(--text-muted)!important}
 .ticker-demo-tag{font-size:7px;letter-spacing:.05em;border:1px solid var(--amber);border-radius:3px;padding:1px 3px;color:var(--amber)!important}
 @keyframes tickerScroll{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
 .st-key-refresh_market_quotes button{min-height:78px!important;width:100%;padding:8px!important}
-/* Scenario cards explicitly use theme tokens so text remains readable in light mode. */
 .preset-kicker{font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:800;letter-spacing:.12em;color:var(--cobalt)!important;margin:0 0 8px;text-transform:uppercase}
 .preset-card-title{font-size:1.02rem;line-height:1.25;font-weight:800;color:var(--text-primary)!important;margin:0 0 8px}
 .preset-description{font-size:12px;line-height:1.5;color:var(--text-secondary)!important;min-height:54px;margin:0 0 12px}
@@ -208,13 +209,7 @@ small,.stCaption,[data-testid="stCaption"]{color:var(--text-muted)!important}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001s!important;transition-duration:.001s!important;scroll-behavior:auto!important}}
 """)
 CSS = OVERRIDE_CSS.substitute(THEME).replace("COLOR_SCHEME", "dark" if st.session_state.theme == "dark" else "light")
-# Template substitutes literal '$focus', '$ring', etc. as separate tokens.
 st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
-
-# ═══════════════════════════════════════════════════════════════════════
-# Hardened inference helpers are imported from sentinel_hardening.py.
-# This keeps production behavior and the offline unit tests on one code path.
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @st.cache_data(ttl=PING_TTL_S, show_spinner=False)
@@ -228,12 +223,14 @@ def ping_service(url: str) -> tuple[bool, Optional[int]]:
         return False, None
 
 
-def get_secret(key: str) -> str:
+def get_secret(key: str, default: Optional[str] = None) -> str:
     try:
         value = st.secrets.get(key)
     except (FileNotFoundError, KeyError, AttributeError):
         value = None
     if not value:
+        if default is not None:
+            return default.strip().rstrip("/")
         st.error(f"Missing configuration: `{key}` was not found in Streamlit secrets.")
         st.info(f'Add `{key} = "https://your-service-url"` to `.streamlit/secrets.toml` or your Streamlit Cloud app secrets.')
         st.stop()
@@ -242,6 +239,15 @@ def get_secret(key: str) -> str:
         st.error(f"`{key}` must be a full HTTP(S) URL.")
         st.stop()
     return value
+
+
+def is_placeholder_url(url: str) -> bool:
+    """Return True if a secret URL is empty or still set to a placeholder template."""
+    cleaned = (url or "").strip().lower()
+    if not cleaned or not cleaned.startswith(("https://", "http://")):
+        return True
+    placeholder_tokens = ("your-lstm", "your_lstm", "placeholder", "example.com", "example.invalid", "<", ">")
+    return any(token in cleaned for token in placeholder_tokens)
 
 
 # ── Deep-linking and editor callbacks ──────────────────────────────────
@@ -339,6 +345,7 @@ PRESETS = [
         "summary": "Operations remain in line with multi-year historical averages with no guidance changes.",
     },
 ]
+
 
 def load_preset(idx: int, apply_query: bool = True) -> None:
     preset = PRESETS[idx]
@@ -486,8 +493,6 @@ TICKER_UNIVERSE = [
     {"label": "TSLA", "symbol": "TSLA", "kind": "usd"},
 ]
 
-# Historical values are intentionally used ONLY when the market feed is unreachable.
-# Every fallback quote is labeled DEMO; values are not represented as current prices.
 DEMO_TICKERS = [
     ("SPX", "5,842.16", "+0.82%", True), ("NDX", "20,341.55", "+1.24%", True),
     ("DJI", "42,118.91", "-0.18%", False), ("VIX", "14.32", "-3.21%", False),
@@ -509,7 +514,6 @@ def _finite_number(value: Any) -> Optional[float]:
 
 
 def _fetch_one_ticker(item: dict[str, str]) -> Optional[dict[str, Any]]:
-    """Fetch a no-API-key Yahoo chart snapshot for one instrument."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(item['symbol'], safe='=')}"
     try:
         response = requests.get(
@@ -546,11 +550,6 @@ def _fetch_one_ticker(item: dict[str, str]) -> Optional[dict[str, Any]]:
 
 @st.cache_data(ttl=MARKET_QUOTES_TTL_S, show_spinner=False)
 def fetch_market_quotes() -> dict[str, Any]:
-    """Fetch best-effort Yahoo Finance snapshots and cache them briefly.
-
-    The cached metadata timestamp represents when the provider requests actually ran,
-    not when a later Streamlit rerun rendered the ticker.
-    """
     from concurrent.futures import as_completed
 
     found: dict[str, dict[str, Any]] = {}
@@ -560,11 +559,9 @@ def fetch_market_quotes() -> dict[str, Any]:
             try:
                 quote = future.result()
             except Exception:
-                # A single failed symbol should never take down the whole banner.
                 quote = None
             if quote is not None:
                 found[quote["label"]] = quote
-    # Preserve the universe order and distinguish fetch time from provider market time.
     ordered: dict[str, Any] = {
         item["label"]: found[item["label"]]
         for item in TICKER_UNIVERSE if item["label"] in found
@@ -577,7 +574,6 @@ def _format_quote_price(quote: dict[str, Any]) -> str:
     price = float(quote["price"])
     kind = quote["kind"]
     if kind == "yield":
-        # Yahoo's ^TNX quote is already expressed as the yield percentage.
         return f"{price:.3f}%"
     if kind == "fx4":
         return f"{price:.4f}"
@@ -589,7 +585,6 @@ def _format_quote_price(quote: dict[str, Any]) -> str:
 
 
 def _ticker_html(quotes: dict[str, Any], use_demo: bool = False) -> str:
-    """Render all instruments, marking every fallback quote individually as DEMO."""
     demo_by_label = {
         label: {"label": label, "price_text": price, "change_text": delta, "is_up": is_up}
         for label, price, delta, is_up in DEMO_TICKERS
@@ -675,14 +670,24 @@ def _ticker_html(quotes: dict[str, Any], use_demo: bool = False) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# API configuration and health probes
+# API configuration and health probes (3 microservices: SVC, FinBERT, LSTM)
 # ═══════════════════════════════════════════════════════════════════════
-SVC_API_URL = get_secret("SVC_API_URL")
-FINBERT_API_URL = get_secret("FINBERT_API_URL")
+SVC_API_URL = get_secret("SVC_API_URL", default=DEFAULT_SVC_API_URL)
+FINBERT_API_URL = get_secret("FINBERT_API_URL", default=DEFAULT_FINBERT_API_URL)
+LSTM_API_URL = get_secret("LSTM_API_URL", default=LSTM_PLACEHOLDER_URL)
+LSTM_CONFIGURED = not is_placeholder_url(LSTM_API_URL)
+
 svc_online, svc_ping_ms = ping_service(SVC_API_URL)
 fin_online, fin_ping_ms = ping_service(FINBERT_API_URL)
 svc_chip = ("ok", f"SVC · {svc_ping_ms}ms") if svc_online else ("bad", "SVC · UNREACHABLE")
 fin_chip = ("ok", f"FINBERT · {fin_ping_ms}ms") if fin_online else ("bad", "FINBERT · UNREACHABLE")
+
+if LSTM_CONFIGURED:
+    lstm_online, lstm_ping_ms = ping_service(LSTM_API_URL)
+    lstm_chip = ("ok", f"LSTM · {lstm_ping_ms}ms") if lstm_online else ("bad", "LSTM · UNREACHABLE")
+else:
+    lstm_online, lstm_ping_ms = False, None
+    lstm_chip = ("unk", "LSTM · PLACEHOLDER")
 
 # Deep-link preset on first load, before headline widgets are created.
 if st.session_state.active_preset is None and not st.session_state.get("input_0"):
@@ -699,19 +704,22 @@ head_left, head_right = st.columns([5, 1])
 with head_left:
     st.markdown(f"""
     <div class="topbar"><div class="topbar-left"><div class="brand-mark">H</div><div>
-    <div class="brand-title">HEADLINES HEAT</div><div class="brand-tag">Financial Event Classification · v5.0</div></div></div>
-    <div class="topbar-right"><div class="chip {svc_chip[0]}"><span class="chip-dot"></span>{svc_chip[1]}</div>
-    <div class="chip {fin_chip[0]}"><span class="chip-dot"></span>{fin_chip[1]}</div></div></div>
+    <div class="brand-title">HEADLINES HEAT</div><div class="brand-tag">Financial Event Classification · v5.1</div></div></div>
+    <div class="topbar-right">
+      <div class="chip {svc_chip[0]}"><span class="chip-dot"></span>{svc_chip[1]}</div>
+      <div class="chip {fin_chip[0]}"><span class="chip-dot"></span>{fin_chip[1]}</div>
+      <div class="chip {lstm_chip[0]}"><span class="chip-dot"></span>{lstm_chip[1]}</div>
+    </div></div>
     """, unsafe_allow_html=True)
 with head_right:
     st.toggle("☀️ Light" if st.session_state.theme == "dark" else "🌙 Dark",
               key="theme_toggle", on_change=toggle_theme)
 
+
 @st.fragment(run_every=MARKET_QUOTES_TTL_S)
 def render_market_ticker() -> None:
     """Refresh only the quote banner periodically; do not rerun model inference."""
     market_quotes = fetch_market_quotes()
-    # A partial provider response must not make missing symbols disappear or look live.
     using_demo_quotes = not any(spec["label"] in market_quotes for spec in TICKER_UNIVERSE)
     ticker_col, refresh_col = st.columns([12, 1], gap="small")
     with ticker_col:
@@ -734,9 +742,9 @@ render_market_ticker()
 st.markdown("""
 <div class="hero-stack"><div>
 <h1 class="hero-title">Headlines Heat <span class="accent">Prediction</span></h1>
-<p class="hero-sub">A research workbench for financial headlines. Compare a TF-IDF / LinearSVC baseline with FinBERT tone classes or a frozen-Word2Vec LSTM. Outputs are model classifications—not guaranteed forecasts, calibrated confidence, or investment advice.</p>
+<p class="hero-sub">A research workbench for financial headlines. Compare a TF-IDF / LinearSVC baseline with FinBERT tone classes or a frozen-Word2Vec LSTM (`POST /lstm_predict`). Outputs are model classifications—not guaranteed forecasts, calibrated confidence, or investment advice.</p>
 </div><div class="hero-specs">
-<div class="spec-cell"><span class="spec-lbl">Inference branches</span><span class="spec-val">2 parallel calls</span></div>
+<div class="spec-cell"><span class="spec-lbl">Cloud Run Nodes</span><span class="spec-val">SVC · FinBERT · LSTM</span></div>
 <div class="spec-cell"><span class="spec-lbl">Neural options</span><span class="spec-val">FinBERT / LSTM</span></div>
 <div class="spec-cell"><span class="spec-lbl">Payload cap</span><span class="spec-val">12,000 chars</span></div>
 </div></div>
@@ -821,11 +829,11 @@ with panel_right:
     with st.container(border=True):
         MODEL_MAP = {
             "LinearSVC · σ > 1.0 (High)": (1, "1.0σ", "Strict tail-volatility filter"),
-            "LinearSVC · σ > 0.5 (Medium)": (0.5, "0.5σ", "Balanced regime sensitivity"),
-            "LinearSVC · σ > 0.2 (Low)": (0.2, "0.2σ", "High sensitivity to smaller moves"),
+            "LinearSVC · σ > 0.5 (Medium)": (5, "0.5σ", "Balanced regime sensitivity"),
+            "LinearSVC · σ > 0.2 (Low)": (2, "0.2σ", "High sensitivity to smaller moves"),
         }
         selected_svc_label = st.selectbox(
-            "Baseline volatility threshold", options=list(MODEL_MAP.keys()), index=1,
+            "Baseline volatility threshold", options=list(MODEL_MAP.keys()), index=0,
             key="svc_threshold_label",
         )
         st.caption(MODEL_MAP[selected_svc_label][2])
@@ -835,16 +843,21 @@ with panel_right:
             if st.button("FinBERT-Tone", use_container_width=True, key="choose_finbert",
                          type="primary" if st.session_state.dl_branch == "FINBERT-TONE" else "secondary"):
                 st.session_state.dl_branch = "FINBERT-TONE"
+                st.rerun()
         with neural_cols[1]:
             if st.button("LSTM · W2V", use_container_width=True, key="choose_lstm",
                          type="primary" if st.session_state.dl_branch == "LSTM-W2V" else "secondary"):
                 st.session_state.dl_branch = "LSTM-W2V"
+                st.rerun()
         if st.session_state.dl_branch == "LSTM-W2V":
-            st.caption("LSTM is routed through SVC API at model_choice=7.")
+            if LSTM_CONFIGURED:
+                st.caption("LSTM uses POST /lstm_predict on LSTM_API_URL (maxlen=83, Word2Vec frozen).")
+            else:
+                st.caption("⚠️ LSTM_API_URL is currently a placeholder. Set LSTM_API_URL in .streamlit/secrets.toml.")
         else:
-            st.caption("FinBERT uses POST /dl_predict and requires 3 normalized class probabilities.")
+            st.caption("FinBERT uses POST /dl_predict on FINBERT_API_URL (3-class tone softmax).")
         st.text_area(
-            "Extended context · FinBERT only", key="summary_input",
+            "Extended context · FinBERT / LSTM payload", key="summary_input",
             placeholder="Optional 1–3 sentence analyst synthesis…", height=110,
         )
 
@@ -912,19 +925,31 @@ if predict_clicked:
                     if dl_branch == "FINBERT-TONE":
                         neural_future = pool.submit(call_finbert, FINBERT_API_URL, concatenated_headlines, summary, 20)
                     else:
-                        neural_future = pool.submit(call_svc, SVC_API_URL, concatenated_headlines, LSTM_MODEL_CODE, 20)
+                        if LSTM_CONFIGURED:
+                            neural_future = pool.submit(call_lstm, LSTM_API_URL, concatenated_headlines, summary, 20)
+                        else:
+                            neural_future = None
+
                     try:
                         svc_result = svc_future.result()
-                    except Exception as exc:  # Defensive boundary around unforeseen client exceptions
-                        svc_result = inference_error("SVC", exc)
-                    try:
-                        neural_result = neural_future.result()
                     except Exception as exc:
-                        neural_result = inference_error(dl_branch, exc)
+                        svc_result = inference_error("SVC", exc)
+
+                    if neural_future is not None:
+                        try:
+                            neural_result = neural_future.result()
+                        except Exception as exc:
+                            neural_result = inference_error(dl_branch, exc)
+                    else:
+                        neural_result = {
+                            "ok": False, "val": None, "latency_ms": 0, "last_attempt_latency_ms": 0,
+                            "error": "LSTM_API_URL placeholder active. Add your deployed LSTM Cloud Run URL to `.streamlit/secrets.toml`.",
+                            "data": {}, "attempts": 0, "status": None, "placeholder": True,
+                        }
+
             wall_ms = int((time.perf_counter() - dispatch_started) * 1000)
             neural_result["branch"] = dl_branch
 
-            # Snapshot exact request inputs so later edits cannot alter this report.
             previous = st.session_state.get("last_results")
             st.session_state.previous_results = previous
             st.session_state.last_results = {
@@ -946,7 +971,7 @@ if predict_clicked:
             svc_label = "HOT" if svc_result["ok"] and svc_result["val"] == 1 else (
                 "COLD" if svc_result["ok"] else "ERR")
             neural_label = "HOT" if neural_result["ok"] and neural_result["val"] == 1 else (
-                "COLD" if neural_result["ok"] else "ERR")
+                "COLD" if neural_result["ok"] else ("PEND" if neural_result.get("placeholder") else "ERR"))
             st.session_state.run_log.append({
                 "req_id": req_id,
                 "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
@@ -962,9 +987,13 @@ if predict_clicked:
             st.session_state.run_log = st.session_state.run_log[-LOG_LEN:]
 
             p_hot_snap: Optional[float] = None
-            if neural_result["ok"] and dl_branch == "FINBERT-TONE":
-                probs_snapshot = neural_result["data"].get("probabilities", {})
-                p_hot_snap = float(probs_snapshot["hot_rising"] + probs_snapshot["hot_falling"])
+            if neural_result["ok"]:
+                if dl_branch == "FINBERT-TONE":
+                    probs_snapshot = neural_result["data"].get("probabilities", {})
+                    p_hot_snap = float(probs_snapshot["hot_rising"] + probs_snapshot["hot_falling"])
+                else:
+                    p_hot_snap = float(neural_result["data"].get("prob_hot", 0.0))
+
             st.session_state.run_history.append({
                 "ts": st.session_state.run_log[-1]["ts"],
                 "label": st.session_state.run_log[-1]["ts"],
@@ -976,6 +1005,8 @@ if predict_clicked:
 
             if svc_result["ok"] and neural_result["ok"]:
                 st.toast(f"Inference complete · {wall_ms} ms wall time · req {req_id}", icon="✅")
+            elif neural_result.get("placeholder"):
+                st.toast("SVC inference complete · awaiting LSTM_API_URL in secrets.toml", icon="ℹ️")
             elif svc_result["ok"] or neural_result["ok"]:
                 st.toast("Partial inference — one endpoint failed", icon="⚠️")
             else:
@@ -1001,8 +1032,12 @@ if last:
     st.markdown('<div class="section-label" data-num="04">Cross-Model Classification Agreement</div>', unsafe_allow_html=True)
     if not (svc_result["ok"] and neural_result["ok"]):
         agreement_pct: Optional[float] = None
-        verdict_kind, verdict_title = "partial", "⚠ PARTIAL INFERENCE"
-        verdict_sub = "At least one endpoint failed. A failed request is not a COLD or negative signal; inspect the endpoint errors below."
+        if neural_result.get("placeholder"):
+            verdict_kind, verdict_title = "split", "⏳ AWAITING LSTM_API_URL IN SECRETS.TOML"
+            verdict_sub = "Baseline SVC inference succeeded. Paste your deployed LSTM Cloud Run URL into `.streamlit/secrets.toml` under `LSTM_API_URL` to activate live `/lstm_predict` consensus."
+        else:
+            verdict_kind, verdict_title = "partial", "⚠ PARTIAL INFERENCE"
+            verdict_sub = "At least one endpoint failed. A failed request is not a COLD or negative signal; inspect the endpoint errors below."
     else:
         svc_is_hot = svc_result["val"] == 1
         nn_is_hot = neural_result["val"] == 1
@@ -1021,7 +1056,7 @@ if last:
                     )
                 else:
                     verdict_kind, verdict_title = "hot", "CONCORDANT HOT CLASSIFICATION"
-                    verdict_sub = "Both endpoints classify the input as HOT. Agreement is not calibrated confidence and does not guarantee realized volatility."
+                    verdict_sub = "Both the LinearSVC baseline and the frozen-Word2Vec LSTM (`POST /lstm_predict`) classify the input as HOT."
             else:
                 verdict_kind, verdict_title = "cold", "CONCORDANT COLD CLASSIFICATION"
                 verdict_sub = "Both endpoints classify the input as COLD. Agreement does not guarantee low future volatility or market stability."
@@ -1031,7 +1066,11 @@ if last:
             verdict_sub = "The binary outputs disagree. Review source headlines, target definitions and model diagnostics before interpreting the result."
 
     svc_chip_txt = ("<span class='v-hot'>HOT</span>" if svc_result["val"] == 1 else "<span class='v-cold'>COLD</span>") if svc_result["ok"] else "<span class='v-err'>ERR</span>"
-    nn_chip_txt = ("<span class='v-hot'>HOT</span>" if neural_result["val"] == 1 else "<span class='v-cold'>COLD</span>") if neural_result["ok"] else "<span class='v-err'>ERR</span>"
+    nn_chip_txt = (
+        ("<span class='v-hot'>HOT</span>" if neural_result["val"] == 1 else "<span class='v-cold'>COLD</span>")
+        if neural_result["ok"]
+        else ("<span class='v-na'>PLACEHOLDER</span>" if neural_result.get("placeholder") else "<span class='v-err'>ERR</span>")
+    )
 
     delta_html = ""
     previous = st.session_state.get("previous_results")
@@ -1139,25 +1178,60 @@ if last:
             </div>
             """, unsafe_allow_html=True)
         elif neural_result["ok"]:
+            data = neural_result["data"]
+            probs = data.get("probabilities", {})
+            p_hot = float(data.get("prob_hot", probs.get("hot", 1.0 if neural_result["val"] == 1 else 0.0)))
+            p_cold = float(data.get("prob_cold", probs.get("cold", 1.0 - p_hot)))
+            hot_pct, cold_pct = p_hot * 100, p_cold * 100
+            seq_len = data.get("sequence_length", 83)
+            matched_toks = data.get("matched_tokens", 0)
             nn_hot = neural_result["val"] == 1
             nn_kind = "hot" if nn_hot else "cold"
             nn_icon = "🔥" if nn_hot else "❄️"
-            nn_title = "EVENT-DRIVEN VOLATILITY" if nn_hot else "QUIET TAPE"
-            nn_desc = (
-                "Frozen Word2Vec embeddings feed the LSTM binary classifier; this result is a hard label, not a probability."
-                if nn_hot else "The LSTM returned its COLD binary label. This is not a guarantee of low future volatility."
-            )
+            nn_title = "EVENT-DRIVEN VOLATILITY · HOT" if nn_hot else "QUIET TAPE · COLD"
+            gauge_value = p_hot if nn_hot else p_cold
+            gauge_label = "P(HOT)" if nn_hot else "P(COLD)"
+            dominant_lbl = "HOT" if nn_hot else "COLD"
+
             st.markdown(f"""
             <div class="glass-card regime-{nn_kind}">
               <div class="card-title-row"><div><div class="card-eyebrow">Model 02 · Neural</div>
-              <div class="card-title">LSTM · Frozen Word2Vec</div><div class="card-subtitle">best_lstm_it13_w2v_frozen · binary head</div></div>
+              <div class="card-title">LSTM · Frozen Word2Vec</div><div class="card-subtitle">best_lstm_it13_w2v_frozen.keras · tokenizer_min5</div></div>
               <div class="latency-pill">{neural_result['latency_ms']} ms</div></div>
               <div class="regime-display {nn_kind}"><div class="regime-icon {nn_kind}">{nn_icon}</div><div class="regime-text-block">
-              <div class="regime-label">Predicted regime</div><div class="regime-title {nn_kind}">{safe_text(nn_title)}</div></div></div>
-              <div class="hard-badge {nn_kind}"><span class="hard-dot"></span>HARD CLASSIFIER · <span class="hard-val">{nn_kind.upper()}</span></div>
-              <p style="color:var(--text-secondary);font-size:12px;line-height:1.55;margin:13px 0 0">{safe_text(nn_desc)}</p>
-              <table class="meta-table"><tr><td>EMBEDDINGS</td><td>Word2Vec · frozen</td></tr><tr><td>ENCODER</td><td>LSTM recurrent stack</td></tr><tr><td>OUTPUT HEAD</td><td>Binary hard label</td></tr><tr><td>ROUTING</td><td>SVC service · model_choice=7</td></tr></table>
-              <div class="route-tag"><span class="route-method get">GET</span><span>/predict?model_choice=7</span></div>
+              <div class="regime-label">Sigmoid volatility classification</div><div class="regime-title {nn_kind}">{safe_text(nn_title)}</div></div>
+              <div>{_gauge_svg(gauge_value, nn_kind, 86, 88, 31, 27, 7.5, gauge_label)}</div></div>
+              <div class="spectrum-wrapper"><div class="spectrum-header"><span>2-class sigmoid distribution</span><span>API dominant: <strong style="color:var(--text-primary)">{dominant_lbl}</strong></span></div>
+              <div class="spectrum-bar"><div class="seg-cold" style="width:{cold_pct:.3f}%"></div><div class="seg-hot" style="width:{hot_pct:.3f}%"></div></div></div>
+              <div class="prob-grid">
+                <div class="prob-row"><div class="prob-meta"><span class="prob-name">◆ COLD · STABLE REGIME</span><span class="prob-pct">{cold_pct:.2f}%</span></div><div class="prob-track"><div class="prob-fill prob-fill-cold" style="width:{cold_pct:.3f}%"></div></div></div>
+                <div class="prob-row"><div class="prob-meta"><span class="prob-name">🔥 HOT · VOLATILE REGIME</span><span class="prob-pct">{hot_pct:.2f}%</span></div><div class="prob-track"><div class="prob-fill prob-fill-hot" style="width:{hot_pct:.3f}%"></div></div></div>
+              </div>
+              <div class="metrics-strip">
+                <div class="metric-cell"><div class="metric-val">{neural_result['val']}</div><div class="metric-lbl">Binary class</div></div>
+                <div class="metric-cell"><div class="metric-val">{safe_text(matched_toks)}</div><div class="metric-lbl">Matched tokens</div></div>
+                <div class="metric-cell"><div class="metric-val">{safe_text(seq_len)}</div><div class="metric-lbl">Sequence len</div></div>
+              </div>
+              <div class="route-tag"><span class="route-method post">POST</span><span>/lstm_predict</span></div>
+            </div>
+            """, unsafe_allow_html=True)
+        elif neural_result.get("placeholder"):
+            st.markdown("""
+            <div class="glass-card">
+              <div class="card-title-row"><div><div class="card-eyebrow">Model 02 · Neural</div>
+              <div class="card-title">LSTM · Frozen Word2Vec</div><div class="card-subtitle">best_lstm_it13_w2v_frozen.keras · POST /lstm_predict</div></div>
+              <div class="latency-pill">STANDBY</div></div>
+              <div class="placeholder-box">
+                <div class="ph-title">Awaiting LSTM_API_URL in secrets.toml</div>
+                <div class="ph-body">
+                  Your LSTM container is being deployed to Cloud Run. Once the deployment URL is ready, paste it into
+                  <code>.streamlit/secrets.toml</code> as:<br><br>
+                  <code>LSTM_API_URL = "https://your-lstm-service.europe-west1.run.app"</code><br><br>
+                  This panel will automatically connect to <code>POST /lstm_predict</code> and render the radial gauge,
+                  2-class sigmoid probabilities, and token-matching telemetry.
+                </div>
+              </div>
+              <div class="route-tag"><span class="route-method post">POST</span><span>/lstm_predict</span></div>
             </div>
             """, unsafe_allow_html=True)
         else:
@@ -1167,11 +1241,10 @@ if last:
         "Interpretation guardrail: only treat the two binary labels as directly comparable if both endpoints were trained and evaluated against the same HOT/COLD target. FinBERT's 3-class tone distribution by itself is a sentiment output, not a volatility forecast."
     )
 
-    # Probability trend: keep only runs where numeric FinBERT probabilities exist.
     probability_history = [item for item in st.session_state.get("run_history", []) if item.get("p_hot") is not None]
     if len(probability_history) >= 2:
         st.markdown('<div class="section-label" data-num="05B">Probability Trend</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="card-eyebrow">P(HOT) derived from FinBERT tone classes · last {len(probability_history)} successful runs</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="card-eyebrow">P(HOT) across neural runs · last {len(probability_history)} successful runs</div>', unsafe_allow_html=True)
         try:
             import pandas as pd
             trend_df = pd.DataFrame([{"run": item["label"], "P(HOT)": item["p_hot"]} for item in probability_history])
@@ -1179,7 +1252,6 @@ if last:
         except Exception:
             st.caption("Trend chart unavailable in this environment.")
 
-    # Export report uses immutable run snapshots (not whatever the user edits later).
     report = {
         "session": st.session_state.sid,
         "request_id": req_id,
@@ -1211,7 +1283,8 @@ if last:
             st.caption("GET /predict — LinearSVC baseline (SVC_API_URL)")
             if svc_result["ok"]:
                 st.json({
-                    "route": "/predict", "latency_ms": svc_result["latency_ms"],
+                    "endpoint": f"{SVC_API_URL}/predict",
+                    "latency_ms": svc_result["latency_ms"],
                     "last_attempt_latency_ms": svc_result.get("last_attempt_latency_ms"),
                     "attempts": svc_result.get("attempts"), "model_choice": model_code,
                     "headline_preview": concat_snapshot[:200] + ("…" if len(concat_snapshot) > 200 else ""),
@@ -1223,18 +1296,17 @@ if last:
             if dl_branch == "FINBERT-TONE":
                 st.caption("POST /dl_predict — FinBERT-Tone (FINBERT_API_URL)")
                 if neural_result["ok"]:
-                    st.json({"route": "/dl_predict", "latency_ms": neural_result["latency_ms"],
+                    st.json({"endpoint": f"{FINBERT_API_URL}/dl_predict", "latency_ms": neural_result["latency_ms"],
                              "last_attempt_latency_ms": neural_result.get("last_attempt_latency_ms"),
                              "attempts": neural_result.get("attempts"), "response_payload": neural_result["data"]})
                 else:
                     st.error(neural_result.get("error") or "Unknown error")
             else:
-                st.caption("GET /predict — LSTM-W2V, model_choice=7 (SVC_API_URL)")
+                st.caption("POST /lstm_predict — Keras LSTM + tokenizer_min5 (LSTM_API_URL)")
                 if neural_result["ok"]:
-                    st.json({"route": "/predict", "latency_ms": neural_result["latency_ms"],
+                    st.json({"endpoint": f"{LSTM_API_URL}/lstm_predict", "latency_ms": neural_result["latency_ms"],
                              "last_attempt_latency_ms": neural_result.get("last_attempt_latency_ms"),
-                             "attempts": neural_result.get("attempts"), "model_choice": LSTM_MODEL_CODE,
-                             "prediction": neural_result["val"]})
+                             "attempts": neural_result.get("attempts"), "response_payload": neural_result["data"]})
                 else:
                     st.error(neural_result.get("error") or "Unknown error")
         st.caption("Headline ingest manifest")
@@ -1249,7 +1321,7 @@ if last:
         log_rows = ""
         for entry in reversed(st.session_state.run_log[-6:]):
             svc_class = {"HOT": "v-hot", "COLD": "v-cold"}.get(entry["svc"], "v-err")
-            nn_class = {"HOT": "v-hot", "COLD": "v-cold"}.get(entry["nn"], "v-err")
+            nn_class = {"HOT": "v-hot", "COLD": "v-cold", "PEND": "v-na"}.get(entry["nn"], "v-err")
             retry_note = ""
             if entry.get("svc_attempts", 0) > 1 or entry.get("nn_attempts", 0) > 1:
                 retry_note = f" ↻{max(entry.get('svc_attempts', 0), entry.get('nn_attempts', 0))}"
@@ -1268,7 +1340,7 @@ elif not predict_clicked:
     st.markdown('''<div class="empty-state"><div class="empty-icon">🎯</div><div class="empty-title">Ready when you are</div><div class="empty-desc">Select a synthetic scenario or enter your own headlines, then execute Dual Inference to dispatch both model calls concurrently.</div></div>''', unsafe_allow_html=True)
 
 st.markdown(f"""
-<div class="footnote"><span class="footnote-brand">HEADLINES HEAT PREDICTION</span> · Financial News Signal Lab · build 5.0.0 · session {safe_text(st.session_state.sid)}<br>
+<div class="footnote"><span class="footnote-brand">HEADLINES HEAT PREDICTION</span> · Financial News Signal Lab · build 5.1.0 · session {safe_text(st.session_state.sid)}<br>
 Inference endpoints are loaded from Streamlit secrets · market quotes are Yahoo Finance snapshots when available or clearly labeled demo placeholders · research signals only, not investment advice
 </div>
 """, unsafe_allow_html=True)

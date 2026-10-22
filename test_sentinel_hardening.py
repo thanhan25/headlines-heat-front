@@ -8,6 +8,8 @@ import requests
 from sentinel_hardening import (
     CircuitBreaker,
     _validate_finbert_probabilities,
+    _validate_lstm_probabilities,
+    call_lstm,
     call_with_retry,
     parse_prediction_response,
 )
@@ -52,6 +54,37 @@ class SentinelHardeningTests(unittest.TestCase):
         ok, error = _validate_finbert_probabilities(payload)
         self.assertFalse(ok)
         self.assertIn("sum to 1", error)
+
+    def test_lstm_probability_contract(self):
+        payload = {
+            "prediction": 1,
+            "label": "hot",
+            "prob_hot": 0.6883,
+            "prob_cold": 0.3117,
+            "probabilities": {"cold": 0.3117, "hot": 0.6883},
+            "sequence_length": 83,
+            "matched_tokens": 1,
+        }
+        ok, error = _validate_lstm_probabilities(payload)
+        self.assertTrue(ok, error)
+        self.assertAlmostEqual(payload["prob_hot"], 0.6883)
+        self.assertAlmostEqual(payload["prob_cold"], 0.3117)
+
+    def test_call_lstm_parses_valid_response(self):
+        good = response(payload={
+            "prediction": 1,
+            "label": "hot",
+            "prob_hot": 0.6883,
+            "prob_cold": 0.3117,
+            "probabilities": {"cold": 0.3117, "hot": 0.6883},
+            "sequence_length": 83,
+            "matched_tokens": 1,
+        })
+        with patch("sentinel_hardening.requests.post", return_value=good):
+            res = call_lstm("https://lstm.example.invalid", "earnings surge")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["val"], 1)
+        self.assertEqual(res["data"]["matched_tokens"], 1)
 
     def test_retry_then_success_reports_actual_attempts(self):
         good = response(payload={"prediction": 0})
