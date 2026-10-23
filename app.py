@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib
 import io
 import json
 import math
@@ -15,7 +16,20 @@ from typing import Any, Optional
 import requests
 import streamlit as st
 
-from sentinel_hardening import call_finbert, call_lstm, call_svc, safe_text
+import sentinel_hardening
+
+# Force reload so Streamlit Cloud hot-reloads pick up newly added functions in sentinel_hardening.py
+importlib.reload(sentinel_hardening)
+
+from sentinel_hardening import (  # noqa: E402
+    CONNECT_TIMEOUT_S,
+    PROBABILITY_SUM_TOLERANCE,
+    call_finbert,
+    call_svc,
+    call_with_retry,
+    parse_prediction_response,
+    safe_text,
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Headlines Heat Prediction — financial headline classification workbench.
@@ -39,10 +53,6 @@ LOG_LEN = 12
 LSTM_MODEL_CODE = 7
 MARKET_QUOTES_TTL_S = 90
 MARKET_HTTP_TIMEOUT = (1.2, 2.2)
-
-DEFAULT_SVC_API_URL = "https://stockapi-241812484319.europe-west1.run.app"
-DEFAULT_FINBERT_API_URL = "https://trading-heat-api-398091546603.europe-west1.run.app"
-LSTM_PLACEHOLDER_URL = "https://YOUR-LSTM-SERVICE-URL.europe-west1.run.app"
 
 # ── Session state and theme ────────────────────────────────────────────
 st.session_state.setdefault("theme", "dark")
@@ -212,6 +222,56 @@ CSS = OVERRIDE_CSS.substitute(THEME).replace("COLOR_SCHEME", "dark" if st.sessio
 st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
 
 
+def _fallback_call_lstm(url: str, headline: str, summary: str = "", timeout: int = 20) -> dict[str, Any]:
+    """Fallback LSTM caller in case Streamlit Cloud caches an older sentinel_hardening module."""
+    result: dict[str, Any] = {
+        "ok": False, "val": None, "latency_ms": 0,
+        "last_attempt_latency_ms": 0, "error": "", "data": {},
+        "attempts": 0, "status": None,
+    }
+    response_meta = call_with_retry(
+        f"{url.rstrip('/')}/lstm_predict", method="POST",
+        json={"headline": headline, "summary": summary},
+        timeout=(CONNECT_TIMEOUT_S, timeout),
+    )
+    for key in ("latency_ms", "last_attempt_latency_ms", "attempts", "status"):
+        result[key] = response_meta.get(key)
+    if not response_meta["ok"]:
+        result["error"] = response_meta["error"]
+        return result
+
+    ok, payload, error = parse_prediction_response(response_meta["response"])
+    if not ok:
+        result.update(data=payload, error=error)
+        return result
+
+    probs = payload.get("probabilities")
+    if not isinstance(probs, dict) or "cold" not in probs or "hot" not in probs:
+        result.update(ok=False, data=payload, error="LSTM response must include 'probabilities.cold' and 'probabilities.hot'.")
+        return result
+    try:
+        p_cold = float(probs["cold"])
+        p_hot = float(probs["hot"])
+    except (TypeError, ValueError, OverflowError):
+        result.update(ok=False, data=payload, error="LSTM probabilities must be numeric.")
+        return result
+    if not (math.isfinite(p_cold) and math.isfinite(p_hot) and 0.0 <= p_cold <= 1.0 and 0.0 <= p_hot <= 1.0):
+        result.update(ok=False, data=payload, error="LSTM probabilities must be finite values between 0 and 1.")
+        return result
+    if abs((p_cold + p_hot) - 1.0) > PROBABILITY_SUM_TOLERANCE:
+        result.update(ok=False, data=payload, error=f"LSTM class probabilities must sum to 1 (received {p_cold + p_hot:.4f}).")
+        return result
+
+    payload["probabilities"] = {"cold": p_cold, "hot": p_hot}
+    payload["prob_cold"] = p_cold
+    payload["prob_hot"] = p_hot
+    result.update(ok=True, val=payload["prediction"], data=payload, error="")
+    return result
+
+
+call_lstm = getattr(sentinel_hardening, "call_lstm", _fallback_call_lstm)
+
+
 @st.cache_data(ttl=PING_TTL_S, show_spinner=False)
 def ping_service(url: str) -> tuple[bool, Optional[int]]:
     """Reachability check. Any response below 500 means the service responded."""
@@ -223,16 +283,21 @@ def ping_service(url: str) -> tuple[bool, Optional[int]]:
         return False, None
 
 
-def get_secret(key: str, default: Optional[str] = None) -> str:
-    try:
-        value = st.secrets.get(key)
-    except (FileNotFoundError, KeyError, AttributeError):
-        value = None
+def get_secret(key: str, fallback_key: Optional[str] = None) -> str:
+    """Strictly load a required endpoint URL from Streamlit secrets (no public URLs in code)."""
+    value = None
+    for candidate in (key, fallback_key):
+        if not candidate:
+            continue
+        try:
+            value = st.secrets.get(candidate)
+        except (FileNotFoundError, KeyError, AttributeError):
+            value = None
+        if value:
+            break
     if not value:
-        if default is not None:
-            return default.strip().rstrip("/")
         st.error(f"Missing configuration: `{key}` was not found in Streamlit secrets.")
-        st.info(f'Add `{key} = "https://your-service-url"` to `.streamlit/secrets.toml` or your Streamlit Cloud app secrets.')
+        st.info(f'Add `{key} = "https://..."` to `.streamlit/secrets.toml` or your Streamlit Cloud app secrets.')
         st.stop()
     value = str(value).strip().rstrip("/")
     if not value.startswith(("https://", "http://")):
@@ -241,13 +306,20 @@ def get_secret(key: str, default: Optional[str] = None) -> str:
     return value
 
 
-def is_placeholder_url(url: str) -> bool:
-    """Return True if a secret URL is empty or still set to a placeholder template."""
-    cleaned = (url or "").strip().lower()
-    if not cleaned or not cleaned.startswith(("https://", "http://")):
-        return True
-    placeholder_tokens = ("your-lstm", "your_lstm", "placeholder", "example.com", "example.invalid", "<", ">")
-    return any(token in cleaned for token in placeholder_tokens)
+def get_optional_secret(key: str) -> str:
+    """Read an optional secret URL (returns empty string if not yet configured or set to a placeholder)."""
+    try:
+        value = st.secrets.get(key)
+    except (FileNotFoundError, KeyError, AttributeError):
+        value = None
+    if not value:
+        return ""
+    cleaned = str(value).strip().rstrip("/")
+    lowered = cleaned.lower()
+    placeholder_tokens = ("placeholder", "your-", "your_", "example.com", "example.invalid", "<", ">")
+    if not lowered.startswith(("https://", "http://")) or any(tok in lowered for tok in placeholder_tokens):
+        return ""
+    return cleaned
 
 
 # ── Deep-linking and editor callbacks ──────────────────────────────────
@@ -670,12 +742,12 @@ def _ticker_html(quotes: dict[str, Any], use_demo: bool = False) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# API configuration and health probes (3 microservices: SVC, FinBERT, LSTM)
+# API configuration and health probes (Loaded strictly from st.secrets)
 # ═══════════════════════════════════════════════════════════════════════
-SVC_API_URL = get_secret("SVC_API_URL", default=DEFAULT_SVC_API_URL)
-FINBERT_API_URL = get_secret("FINBERT_API_URL", default=DEFAULT_FINBERT_API_URL)
-LSTM_API_URL = get_secret("LSTM_API_URL", default=LSTM_PLACEHOLDER_URL)
-LSTM_CONFIGURED = not is_placeholder_url(LSTM_API_URL)
+SVC_API_URL = get_secret("SVC_API_URL")
+FINBERT_API_URL = get_secret("FINBERT_API_URL", fallback_key="DL_API_URL")
+LSTM_API_URL = get_optional_secret("LSTM_API_URL")
+LSTM_CONFIGURED = bool(LSTM_API_URL)
 
 svc_online, svc_ping_ms = ping_service(SVC_API_URL)
 fin_online, fin_ping_ms = ping_service(FINBERT_API_URL)
@@ -1034,7 +1106,7 @@ if last:
         agreement_pct: Optional[float] = None
         if neural_result.get("placeholder"):
             verdict_kind, verdict_title = "split", "⏳ AWAITING LSTM_API_URL IN SECRETS.TOML"
-            verdict_sub = "Baseline SVC inference succeeded. Paste your deployed LSTM Cloud Run URL into `.streamlit/secrets.toml` under `LSTM_API_URL` to activate live `/lstm_predict` consensus."
+            verdict_sub = "Baseline SVC inference succeeded. Add your deployed LSTM Cloud Run URL to `.streamlit/secrets.toml` under `LSTM_API_URL` to activate live `/lstm_predict` consensus."
         else:
             verdict_kind, verdict_title = "partial", "⚠ PARTIAL INFERENCE"
             verdict_sub = "At least one endpoint failed. A failed request is not a COLD or negative signal; inspect the endpoint errors below."
@@ -1224,9 +1296,8 @@ if last:
               <div class="placeholder-box">
                 <div class="ph-title">Awaiting LSTM_API_URL in secrets.toml</div>
                 <div class="ph-body">
-                  Your LSTM container is being deployed to Cloud Run. Once the deployment URL is ready, paste it into
-                  <code>.streamlit/secrets.toml</code> as:<br><br>
-                  <code>LSTM_API_URL = "https://your-lstm-service.europe-west1.run.app"</code><br><br>
+                  Your LSTM container is being deployed to Cloud Run. Once the deployment URL is ready, add
+                  <code>LSTM_API_URL</code> to <code>.streamlit/secrets.toml</code> (or Streamlit Cloud Secrets).
                   This panel will automatically connect to <code>POST /lstm_predict</code> and render the radial gauge,
                   2-class sigmoid probabilities, and token-matching telemetry.
                 </div>
@@ -1283,7 +1354,7 @@ if last:
             st.caption("GET /predict — LinearSVC baseline (SVC_API_URL)")
             if svc_result["ok"]:
                 st.json({
-                    "endpoint": f"{SVC_API_URL}/predict",
+                    "route": "/predict",
                     "latency_ms": svc_result["latency_ms"],
                     "last_attempt_latency_ms": svc_result.get("last_attempt_latency_ms"),
                     "attempts": svc_result.get("attempts"), "model_choice": model_code,
@@ -1296,7 +1367,7 @@ if last:
             if dl_branch == "FINBERT-TONE":
                 st.caption("POST /dl_predict — FinBERT-Tone (FINBERT_API_URL)")
                 if neural_result["ok"]:
-                    st.json({"endpoint": f"{FINBERT_API_URL}/dl_predict", "latency_ms": neural_result["latency_ms"],
+                    st.json({"route": "/dl_predict", "latency_ms": neural_result["latency_ms"],
                              "last_attempt_latency_ms": neural_result.get("last_attempt_latency_ms"),
                              "attempts": neural_result.get("attempts"), "response_payload": neural_result["data"]})
                 else:
@@ -1304,7 +1375,7 @@ if last:
             else:
                 st.caption("POST /lstm_predict — Keras LSTM + tokenizer_min5 (LSTM_API_URL)")
                 if neural_result["ok"]:
-                    st.json({"endpoint": f"{LSTM_API_URL}/lstm_predict", "latency_ms": neural_result["latency_ms"],
+                    st.json({"route": "/lstm_predict", "latency_ms": neural_result["latency_ms"],
                              "last_attempt_latency_ms": neural_result.get("last_attempt_latency_ms"),
                              "attempts": neural_result.get("attempts"), "response_payload": neural_result["data"]})
                 else:
